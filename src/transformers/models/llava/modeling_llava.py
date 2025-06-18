@@ -1029,7 +1029,7 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel, GenerationMixin):
         # 视觉特征提取：通过vision_tower处理pixel_values，提取视觉特征。
         visual_features = self.vision_tower(pixel_values)
          # image_features 是 vision_tower 的输出
-        print("我加的1：Shape BEFORE projector:", visual_features.shape)
+        print("我加的1修改：Shape BEFORE projector:", visual_features.shape)
         # 特征投影：通过multi_modal_projector将视觉特征转换为对齐后的image_features。从1024维投影到4096维
         image_features = self.multi_modal_projector(visual_features)
         print("我加的2：Shape AFTER projector:", image_features.shape)
