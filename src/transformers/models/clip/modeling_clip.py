@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # coding=utf-8
 # Copyright 2021 The OpenAI Team Authors and The HuggingFace Team. All rights reserved.
 #
@@ -15,7 +16,7 @@
 """PyTorch CLIP model."""
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -37,7 +38,6 @@ logger = logging.get_logger(__name__)
 def contrastive_loss(logits: torch.Tensor) -> torch.Tensor:
     return nn.functional.cross_entropy(logits, torch.arange(len(logits), device=logits.device))
 
-
 def clip_loss(similarity: torch.Tensor) -> torch.Tensor:
     caption_loss = contrastive_loss(similarity)
     image_loss = contrastive_loss(similarity.t())
@@ -54,7 +54,7 @@ def _get_vector_norm(tensor: torch.Tensor) -> torch.Tensor:
     normed_tensor = torch.pow(sum_tensor, 0.5)
     return normed_tensor
 
-
+# 重要概念: 模型输出类型定义
 @dataclass
 class CLIPVisionModelOutput(ModelOutput):
     """
@@ -80,8 +80,8 @@ class CLIPVisionModelOutput(ModelOutput):
 
     image_embeds: Optional[torch.FloatTensor] = None
     last_hidden_state: Optional[torch.FloatTensor] = None
-    hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
-    attentions: Optional[tuple[torch.FloatTensor, ...]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
 
 
 @dataclass
@@ -109,9 +109,8 @@ class CLIPTextModelOutput(ModelOutput):
 
     text_embeds: Optional[torch.FloatTensor] = None
     last_hidden_state: Optional[torch.FloatTensor] = None
-    hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
-    attentions: Optional[tuple[torch.FloatTensor, ...]] = None
-
+    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
 
 @dataclass
 class CLIPOutput(ModelOutput):
@@ -143,13 +142,17 @@ class CLIPOutput(ModelOutput):
     text_model_output: BaseModelOutputWithPooling = None
     vision_model_output: BaseModelOutputWithPooling = None
 
-    def to_tuple(self) -> tuple[Any]:
+    def to_tuple(self) -> Tuple[Any]:
         return tuple(
             self[k] if k not in ["text_model_output", "vision_model_output"] else getattr(self, k).to_tuple()
             for k in self.keys()
         )
 
-
+"""
+核心组件3: Vision Embeddings
+原理: 将图像分成patches并进行线性投影,加入位置编码
+作用: 将图像转换为序列形式的特征表示
+"""
 class CLIPVisionEmbeddings(nn.Module):
     def __init__(self, config: CLIPVisionConfig):
         super().__init__()
@@ -159,7 +162,8 @@ class CLIPVisionEmbeddings(nn.Module):
         self.patch_size = config.patch_size
 
         self.class_embedding = nn.Parameter(torch.randn(self.embed_dim))
-
+        
+        # 重要: patch embedding将图像分成patch并投影到embedding空间
         self.patch_embedding = nn.Conv2d(
             in_channels=config.num_channels,
             out_channels=self.embed_dim,
@@ -173,6 +177,7 @@ class CLIPVisionEmbeddings(nn.Module):
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
         self.register_buffer("position_ids", torch.arange(self.num_positions).expand((1, -1)), persistent=False)
 
+    # 重要: 位置编码插值,支持不同分辨率的输入
     def interpolate_pos_encoding(self, embeddings: torch.Tensor, height: int, width: int) -> torch.Tensor:
         """
         This method allows to interpolate the pre-trained position encodings, to be able to use the model on higher resolution
@@ -187,7 +192,6 @@ class CLIPVisionEmbeddings(nn.Module):
         position_embedding = self.position_embedding.weight.unsqueeze(0)
         num_positions = position_embedding.shape[1] - 1
 
-        # always interpolate when tracing to ensure the exported model works for dynamic input shapes
         if not torch.jit.is_tracing() and num_patches == num_positions and height == width:
             return self.position_embedding(self.position_ids)
 
@@ -211,7 +215,6 @@ class CLIPVisionEmbeddings(nn.Module):
         )
 
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
-
         return torch.cat((class_pos_embed, patch_pos_embed), dim=1)
 
     def forward(self, pixel_values: torch.FloatTensor, interpolate_pos_encoding=False) -> torch.Tensor:
@@ -221,7 +224,8 @@ class CLIPVisionEmbeddings(nn.Module):
                 f"Input image size ({height}*{width}) doesn't match model ({self.image_size}*{self.image_size})."
             )
         target_dtype = self.patch_embedding.weight.dtype
-        patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))  # shape = [*, width, grid, grid]
+        # 数据流: 图像 -> patches -> flatten -> 加入class token -> 加入位置编码
+        patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))  
         patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
 
         class_embeds = self.class_embedding.expand(batch_size, 1, -1)
@@ -232,7 +236,11 @@ class CLIPVisionEmbeddings(nn.Module):
             embeddings = embeddings + self.position_embedding(self.position_ids)
         return embeddings
 
-
+"""
+核心组件4: Text Embeddings 
+原理: 对文本token进行embedding并加入位置编码
+作用: 将文本转换为序列形式的特征表示
+"""
 class CLIPTextEmbeddings(nn.Module):
     def __init__(self, config: CLIPTextConfig):
         super().__init__()
@@ -272,7 +280,11 @@ class CLIPTextEmbeddings(nn.Module):
 
         return embeddings
 
-
+"""
+核心组件5: Attention机制
+原理: 多头自注意力,计算query-key相似度并加权value
+作用: 捕获序列内的长程依赖关系
+"""
 def eager_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -284,6 +296,7 @@ def eager_attention_forward(
     output_attentions: bool = True,
     **kwargs,
 ):
+    # 数据流: Q,K,V -> QK^T -> softmax -> dropout -> 加权V
     attn_weights = torch.matmul(query, key.transpose(-1, -2)) * scaling
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask
@@ -295,7 +308,6 @@ def eager_attention_forward(
     if not output_attentions:
         attn_weights = None
     return attn_output, attn_weights
-
 
 class CLIPAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -326,11 +338,12 @@ class CLIPAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         causal_attention_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = False,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Input shape: Batch x Time x Channel"""
 
         batch_size, seq_length, embed_dim = hidden_states.shape
 
+        # 数据流: hidden_states -> Q,K,V投影 -> reshape多头 -> attention计算 -> concat多头
         queries = self.q_proj(hidden_states)
         keys = self.k_proj(hidden_states)
         values = self.v_proj(hidden_states)
@@ -338,8 +351,7 @@ class CLIPAttention(nn.Module):
         queries = queries.view(batch_size, seq_length, -1, self.head_dim).transpose(1, 2)
         keys = keys.view(batch_size, seq_length, -1, self.head_dim).transpose(1, 2)
         values = values.view(batch_size, seq_length, -1, self.head_dim).transpose(1, 2)
-        # CLIP text model uses both `causal_attention_mask` and `attention_mask`
-        # in case FA2 kernel is called, `is_causal` should be inferred from `causal_attention_mask`
+
         if self.config._attn_implementation == "flash_attention_2":
             self.is_causal = causal_attention_mask is not None
         else:
@@ -377,7 +389,11 @@ class CLIPAttention(nn.Module):
             attn_weights = None
         return attn_output, attn_weights
 
-
+"""
+核心组件6: MLP
+原理: 两层全连接网络,中间带激活函数
+作用: 增加模型非线性表达能力
+"""
 class CLIPMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -392,7 +408,11 @@ class CLIPMLP(nn.Module):
         hidden_states = self.fc2(hidden_states)
         return hidden_states
 
-
+"""
+核心组件7: Transformer Encoder Layer
+原理: 自注意力层 + MLP层,每层都有残差连接和Layer Norm
+作用: 特征提取的基本单元
+"""
 class CLIPEncoderLayer(nn.Module):
     def __init__(self, config: Union[CLIPVisionConfig, CLIPTextConfig]):
         super().__init__()
@@ -408,17 +428,8 @@ class CLIPEncoderLayer(nn.Module):
         attention_mask: torch.Tensor,
         causal_attention_mask: torch.Tensor,
         output_attentions: Optional[bool] = False,
-    ) -> tuple[torch.FloatTensor]:
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`): attention mask of size
-                `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
-                `(config.encoder_attention_heads,)`.
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-        """
+    ) -> Tuple[torch.FloatTensor]:
+        # 数据流: input -> norm -> attn -> residual -> norm -> mlp -> residual
         residual = hidden_states
 
         hidden_states = self.layer_norm1(hidden_states)
@@ -442,7 +453,10 @@ class CLIPEncoderLayer(nn.Module):
 
         return outputs
 
-
+"""
+重要概念: 预训练模型基类
+定义了模型初始化、权重加载等基础功能
+"""
 @auto_docstring
 class CLIPPreTrainedModel(PreTrainedModel):
     config_class = CLIPConfig
@@ -509,16 +523,12 @@ class CLIPPreTrainedModel(PreTrainedModel):
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
 
-
+"""
+核心组件8: Transformer Encoder
+原理: 堆叠多层Encoder Layer
+作用: 提取深层特征表示
+"""
 class CLIPEncoder(nn.Module):
-    """
-    Transformer encoder consisting of `config.num_hidden_layers` self attention layers. Each layer is a
-    [`CLIPEncoderLayer`].
-
-    Args:
-        config: CLIPConfig
-    """
-
     def __init__(self, config: CLIPConfig):
         super().__init__()
         self.config = config
@@ -534,35 +544,6 @@ class CLIPEncoder(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
     ) -> BaseModelOutput:
-        r"""
-        Args:
-            inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
-                Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation.
-                This is useful if you want more control over how to convert `input_ids` indices into associated vectors
-                than the model's internal embedding lookup matrix.
-            attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
-
-                - 1 for tokens that are **not masked**,
-                - 0 for tokens that are **masked**.
-
-                [What are attention masks?](../glossary#attention-mask)
-            causal_attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Causal mask for the text model. Mask values selected in `[0, 1]`:
-
-                - 1 for tokens that are **not masked**,
-                - 0 for tokens that are **masked**.
-
-                [What are attention masks?](../glossary#attention-mask)
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            output_hidden_states (`bool`, *optional*):
-                Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors
-                for more detail.
-            return_dict (`bool`, *optional*):
-                Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
-        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -572,6 +553,7 @@ class CLIPEncoder(nn.Module):
         all_attentions = () if output_attentions else None
 
         hidden_states = inputs_embeds
+        # 数据流: 逐层处理,可选保存中间状态
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
@@ -605,7 +587,11 @@ class CLIPEncoder(nn.Module):
             attentions=all_attentions,
         )
 
-
+"""
+核心组件9: Text Transformer
+原理: 文本编码器,包含Embeddings和Encoder
+作用: 将文本编码为高维特征
+"""
 class CLIPTextTransformer(nn.Module):
     def __init__(self, config: CLIPTextConfig):
         super().__init__()
@@ -615,10 +601,7 @@ class CLIPTextTransformer(nn.Module):
         self.encoder = CLIPEncoder(config)
         self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
-        # For `pooled_output` computation
         self.eos_token_id = config.eos_token_id
-
-        # For attention mask, it differs between `flash_attention_2` and other attention implementations
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
 
     @can_return_tuple
@@ -631,6 +614,7 @@ class CLIPTextTransformer(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
     ) -> BaseModelOutputWithPooling:
+        # 数据流: input_ids -> embeddings -> encoder -> norm -> pooling
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -644,15 +628,11 @@ class CLIPTextTransformer(nn.Module):
 
         hidden_states = self.embeddings(input_ids=input_ids, position_ids=position_ids)
 
-        # CLIP's text model uses causal mask, prepare it here.
-        # https://github.com/openai/CLIP/blob/cfcffb90e69f37bf2ff1e988237a0fbe41f33c04/clip/model.py#L324
         causal_attention_mask = _create_4d_causal_attention_mask(
             input_shape, hidden_states.dtype, device=hidden_states.device
         )
 
-        # expand attention_mask
         if attention_mask is not None and not self._use_flash_attention_2:
-            # [batch_size, seq_len] -> [batch_size, 1, tgt_seq_len, src_seq_len]
             attention_mask = _prepare_4d_attention_mask(attention_mask, hidden_states.dtype)
 
         encoder_outputs: BaseModelOutput = self.encoder(
@@ -666,23 +646,15 @@ class CLIPTextTransformer(nn.Module):
         last_hidden_state = encoder_outputs.last_hidden_state
         last_hidden_state = self.final_layer_norm(last_hidden_state)
 
+        # 重要: 提取[EOS] token对应的特征作为文本表示
         if self.eos_token_id == 2:
-            # The `eos_token_id` was incorrect before PR #24773: Let's keep what have been done here.
-            # A CLIP model with such `eos_token_id` in the config can't work correctly with extra new tokens added
-            # ------------------------------------------------------------
-            # text_embeds.shape = [batch_size, sequence_length, transformer.width]
-            # take features from the eot embedding (eot_token is the highest number in each sequence)
-            # casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
             pooled_output = last_hidden_state[
                 torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
                 input_ids.to(dtype=torch.int, device=last_hidden_state.device).argmax(dim=-1),
             ]
         else:
-            # The config gets updated `eos_token_id` from PR #24773 (so the use of exta new tokens is possible)
             pooled_output = last_hidden_state[
                 torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
-                # We need to get the first position of `eos_token_id` value (`pad_token_ids` might equal to `eos_token_id`)
-                # Note: we assume each sequence (along batch dim.) contains an  `eos_token_id` (e.g. prepared by the tokenizer)
                 (input_ids.to(dtype=torch.int, device=last_hidden_state.device) == self.eos_token_id)
                 .int()
                 .argmax(dim=-1),
@@ -695,7 +667,11 @@ class CLIPTextTransformer(nn.Module):
             attentions=encoder_outputs.attentions,
         )
 
-
+"""
+核心组件10: Text Model
+原理: 文本编码器的完整实现
+作用: 对外提供文本编码接口
+"""
 @auto_docstring(
     custom_intro="""
     The text model from CLIP without any head or projection on top.
@@ -709,7 +685,6 @@ class CLIPTextModel(CLIPPreTrainedModel):
     def __init__(self, config: CLIPTextConfig):
         super().__init__(config)
         self.text_model = CLIPTextTransformer(config)
-        # Initialize weights and apply final processing
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Module:
@@ -865,6 +840,18 @@ class CLIPModel(CLIPPreTrainedModel):
     _no_split_modules = ["CLIPTextEmbeddings", "CLIPEncoderLayer", "CLIPVisionEmbeddings"]
 
     def __init__(self, config: CLIPConfig):
+        """
+        初始化CLIP模型
+        Args:
+            config: CLIP配置对象,包含text_config和vision_config两个子配置
+        
+        初始化流程:
+        1. 检查配置类型是否正确
+        2. 从配置中获取文本和视觉模型的维度信息
+        3. 初始化文本编码器(CLIPTextModel)和图像编码器(CLIPVisionModel) 
+        4. 初始化投影层,将文本和图像特征映射到相同的投影空间
+        5. 初始化logit_scale参数用于相似度计算
+        """
         super().__init__(config)
 
         if not isinstance(config.text_config, CLIPTextConfig):
@@ -879,27 +866,36 @@ class CLIPModel(CLIPPreTrainedModel):
                 f" {type(config.vision_config)}."
             )
 
-        text_config = config.text_config
-        vision_config = config.vision_config
+        text_config = config.text_config #这步是获取文本模型的配置
+        vision_config = config.vision_config #这步是获取视觉模型的配置
 
-        self.projection_dim = config.projection_dim
-        self.text_embed_dim = text_config.hidden_size
-        self.vision_embed_dim = vision_config.hidden_size
+        self.projection_dim = config.projection_dim #这步是获取投影层的维度，是512
+        self.text_embed_dim = text_config.hidden_size #这步是获取文本模型的输出维度，是768
+        self.vision_embed_dim = vision_config.hidden_size #这步是获取视觉模型的输出维度，是768
 
-        text_model = CLIPTextModel._from_config(text_config)
-        self.text_model = text_model.text_model
+        # 初始化文本编码器
+        text_model = CLIPTextModel._from_config(text_config) #这步是在初始化CLIPTextModel类，并返回一个text_model对象
+        self.text_model = text_model.text_model #
 
+        # 初始化图像编码器
         vision_model = CLIPVisionModel._from_config(vision_config)
         self.vision_model = vision_model.vision_model
 
+        # 初始化投影层,将文本和图像特征映射到相同维度。这个怎么映射的:
+        # 视觉特征的维度是768，投影层的维度是512，所以需要将视觉特征映射到512维度
+        # 文本特征的维度是768，投影层的维度是512，所以需要将文本特征映射到512维度   
+        # 所以需要将视觉特征和文本特征映射到相同维度，这样就可以进行相似度计算了
+        # 把文本特征和视觉特征映射到相同维度，即共享投影层
         self.visual_projection = nn.Linear(self.vision_embed_dim, self.projection_dim, bias=False)
         self.text_projection = nn.Linear(self.text_embed_dim, self.projection_dim, bias=False)
-        self.logit_scale = nn.Parameter(torch.tensor(self.config.logit_scale_init_value))
+        self.logit_scale = nn.Parameter(torch.tensor(self.config.logit_scale_init_value)) #logit_scale是用于相似度计算的参数，初始值为0.07是温度系数
+# self.vision_embed_dim是视觉模型的输出维度是768, self.projection_dim是投影层的输出维度是512  
 
         # Initialize weights and apply final processing
         self.post_init()
 
     @auto_docstring
+    # 获取文本特征
     def get_text_features(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -924,14 +920,16 @@ class CLIPModel(CLIPPreTrainedModel):
         >>> inputs = tokenizer(["a photo of a cat", "a photo of a dog"], padding=True, return_tensors="pt")
         >>> text_features = model.get_text_features(**inputs)
         ```"""
+        # 这步是获取文本模型的输出
         # Use CLIP model's config for some fields (if specified) instead of those of vision & text components.
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
+        output_hidden_states = ( #这步是获取文本模型的输出
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
+        # 这步是获取文本模型的输出
         text_outputs: BaseModelOutputWithPooling = self.text_model(
-            input_ids=input_ids,
+            input_ids=input_ids,#这步是获取文本模型的输入
             attention_mask=attention_mask,
             position_ids=position_ids,
             output_attentions=output_attentions,
@@ -944,12 +942,13 @@ class CLIPModel(CLIPPreTrainedModel):
         return text_features
 
     @auto_docstring
+    # 获取视觉特征
     def get_image_features(
         self,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        interpolate_pos_encoding: bool = False,
+        pixel_values: Optional[torch.FloatTensor] = None, #是图像的输入
+        output_attentions: Optional[bool] = None,#是注意力输出
+        output_hidden_states: Optional[bool] = None,#是隐藏状态输出
+        interpolate_pos_encoding: bool = False,#是位置编码输出
     ) -> torch.FloatTensor:
         r"""
         Returns:
@@ -995,51 +994,50 @@ class CLIPModel(CLIPPreTrainedModel):
     @auto_docstring
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        return_loss: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        interpolate_pos_encoding: bool = False,
+        input_ids: Optional[torch.LongTensor] = None, #是文本的输入
+        pixel_values: Optional[torch.FloatTensor] = None, #是图像的输入
+        attention_mask: Optional[torch.Tensor] = None, #是注意力掩码
+        position_ids: Optional[torch.LongTensor] = None, #是位置编码
+        return_loss: Optional[bool] = None, #是是否返回损失
+        output_attentions: Optional[bool] = None, #是是否返回注意力
+        output_hidden_states: Optional[bool] = None, #是是否返回隐藏状态
+        interpolate_pos_encoding: bool = False, #是是否返回位置编码
     ) -> CLIPOutput:
-        r"""
-        return_loss (`bool`, *optional*):
-            Whether or not to return the contrastive loss.
 
-        Examples:
-
-        ```python
-        >>> from PIL import Image
-        >>> import requests
-        >>> from transformers import AutoProcessor, CLIPModel
-
-        >>> model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-        >>> processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32")
-
-        >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-        >>> image = Image.open(requests.get(url, stream=True).raw)
-
-        >>> inputs = processor(
-        ...     text=["a photo of a cat", "a photo of a dog"], images=image, return_tensors="pt", padding=True
-        ... )
-
-        >>> outputs = model(**inputs)
-        >>> logits_per_image = outputs.logits_per_image  # this is the image-text similarity score
-        >>> probs = logits_per_image.softmax(dim=1)  # we can take the softmax to get the label probabilities
-        ```"""
+        """
+        CLIP模型的前向传播
+        
+        数据流向:
+        1. 图像数据流:
+           pixel_values -> vision_model -> pooler_output -> visual_projection -> image_embeds
+        
+        2. 文本数据流:
+           input_ids -> text_model -> pooler_output -> text_projection -> text_embeds
+           
+        3. 特征归一化:
+           对image_embeds和text_embeds进行L2归一化
+           
+        4. 相似度计算:
+           - 计算文本-图像的相似度矩阵(logits_per_text)
+           - 计算图像-文本的相似度矩阵(logits_per_image) 
+           
+        5. 可选的对比损失计算
+        
+        Returns:
+            CLIPOutput: 包含损失、相似度矩阵、特征嵌入等输出
+        """
         # Use CLIP model's config for some fields (if specified) instead of those of vision & text components.
+        # 这步是获取文本模型的输出
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-
+        # 这步是获取视觉模型的输出
         vision_outputs: BaseModelOutputWithPooling = self.vision_model(
-            pixel_values=pixel_values,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            interpolate_pos_encoding=interpolate_pos_encoding,
+            pixel_values=pixel_values, #这步是获取视觉模型的输入
+            output_attentions=output_attentions,#是注意力输出
+            output_hidden_states=output_hidden_states,#是隐藏状态输出
+            interpolate_pos_encoding=interpolate_pos_encoding,#是位置编码输出
         )
 
         text_outputs: BaseModelOutputWithPooling = self.text_model(
@@ -1049,23 +1047,32 @@ class CLIPModel(CLIPPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
+        # 这步是获取视觉模型的输出
+        image_embeds = vision_outputs.pooler_output  #这步是获取视觉模型的输出给image_embeds
+        image_embeds = self.visual_projection(image_embeds) #这步是获取视觉模型的输出给image_embeds
 
-        image_embeds = vision_outputs.pooler_output
-        image_embeds = self.visual_projection(image_embeds)
-
-        text_embeds = text_outputs.pooler_output
+        text_embeds = text_outputs.pooler_output #这步是获取文本模型的输出给text_embeds
         text_embeds = self.text_projection(text_embeds)
 
         # normalized features
-        image_embeds = image_embeds / _get_vector_norm(image_embeds)
-        text_embeds = text_embeds / _get_vector_norm(text_embeds)
+        # 这步是归一化特征，如何归一化：
+        # 1. 计算特征的范数（L2范数）
+        # 2. 将特征除以其范数，得到归一化后的特征
+        # 3. 归一化后的特征具有单位长度，便于后续的相似度计算
+        image_embeds = image_embeds / _get_vector_norm(image_embeds)  #_get_vector_norm是获取特征的范数
+        text_embeds = text_embeds / _get_vector_norm(text_embeds) #_get_vector_norm是获取特征的范数
+        # 这步是计算相似度
 
-        # cosine similarity as logits
-        logits_per_text = torch.matmul(text_embeds, image_embeds.t().to(text_embeds.device))
-        logits_per_text = logits_per_text * self.logit_scale.exp().to(text_embeds.device)
+        # cosine similarity as logits 是余弦相似度作为logits
+        logits_per_text = torch.matmul(text_embeds, image_embeds.t().to(text_embeds.device))  #这步是计算文本-图像的相似度矩阵，输入是text_embeds和image_embeds，输出是logits_per_text
+        logits_per_text = logits_per_text * self.logit_scale.exp().to(text_embeds.device)#这步是温度缩放相似度矩阵
+        logits_per_image = logits_per_text.t()  #这步是在本到图像的相似度矩阵转置，得到图像到文本的相似度矩阵
+        #scaled_similarity=τcos(θ)​=cos(θ)⋅τ1​=cos(θ)⋅elog(1/τ)  self.logit_scale.exp()即τ是温度参数，θ是余弦相似度
+  
+ #logits_per_text 的形状是 [batch_size_text, batch_size_image]，元素 (i,j) 表示第 i 个文本与第 j 个图像的相似度
+ #logits_per_image 的形状是 [batch_size_image, batch_size_text]，元素 (j,i) 表示第 j 个图像与第 i 个文本的相似度
 
-        logits_per_image = logits_per_text.t()
-
+        
         loss = None
         if return_loss:
             loss = clip_loss(logits_per_text)
