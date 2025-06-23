@@ -552,6 +552,17 @@ class Blip2Encoder(nn.Module):
 
 @auto_docstring
 # Copied from transformers.models.blip.modeling_blip.BlipVisionModel with Blip->Blip2, BLIP->BLIP_2
+# ---------------------------------------------------------------------
+# 核心类 `Blip2VisionModel`
+# 视觉编码器模块，将原始图像 (B, C, H, W) 转换为 Transformer patch 序列。
+# 流程：
+# 1. `Blip2VisionEmbeddings` 将图像分块 (patch_size) 并映射到 `hidden_size`，加入位置编码，可选插值以支持高分辨率。
+# 2. 多层 `Blip2Encoder` (Transformer) 提取全局上下文。
+# 3. `post_layernorm` 归一化输出。
+# 输出 (`BaseModelOutputWithPooling`) 包含：
+#   • `last_hidden_state` (B, seq_len, hidden)——序列级特征。
+#   • `pooler_output`        (B, hidden)——类 token 的图像级表示。
+# ---------------------------------------------------------------------
 class Blip2VisionModel(Blip2PreTrainedModel):
     main_input_name = "pixel_values"
     config_class = Blip2VisionConfig
@@ -561,8 +572,11 @@ class Blip2VisionModel(Blip2PreTrainedModel):
         self.config = config
         embed_dim = config.hidden_size
 
+        # 图像嵌入模块，负责将像素转换为 patch embedding
         self.embeddings = Blip2VisionEmbeddings(config)
+        # 标准的 Transformer Encoder
         self.encoder = Blip2Encoder(config)
+        # Encoder 输出后的层归一化
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
         self.post_init()
@@ -585,8 +599,10 @@ class Blip2VisionModel(Blip2PreTrainedModel):
         if pixel_values is None:
             raise ValueError("You have to specify pixel_values")
 
+        # 步骤 1: 将图像像素值转换为 patch embedding
         hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
 
+        # 步骤 2: 将 patch embedding 送入 Transformer Encoder
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
             output_attentions=output_attentions,
@@ -595,8 +611,10 @@ class Blip2VisionModel(Blip2PreTrainedModel):
         )
 
         last_hidden_state = encoder_outputs[0]
+        # 步骤 3: 对 Encoder 的输出序列进行层归一化
         last_hidden_state = self.post_layernorm(last_hidden_state)
 
+        # 步骤 4: 提取序列的第一个 token ([CLS] token) 作为池化输出，并再次进行层归一化
         pooled_output = last_hidden_state[:, 0, :]
         pooled_output = self.post_layernorm(pooled_output)
 
@@ -615,8 +633,14 @@ class Blip2VisionModel(Blip2PreTrainedModel):
 
 
 class Blip2QFormerMultiHeadAttention(nn.Module):
+    """
+    Q-Former 中多头注意力的核心实现。
+    这个模块可以作为自注意力或交叉注意力使用，由 `is_cross_attention` 标志控制。
+    """
+
     def __init__(self, config, is_cross_attention=False):
         super().__init__()
+        # self.config: 保存 Q-Former 的配置
         self.config = config
         if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
             raise ValueError(
@@ -624,23 +648,40 @@ class Blip2QFormerMultiHeadAttention(nn.Module):
                 % (config.hidden_size, config.num_attention_heads)
             )
 
+        # self.num_attention_heads: 注意力头的数量
         self.num_attention_heads = config.num_attention_heads
+        # self.attention_head_size: 每个注意力头的维度
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        # self.all_head_size: 所有头的维度总和，等于 hidden_size，(即 Q-Former 的维度，768)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
+        # --- Q, K, V 的线性投射层 ---
+        # Query (Q): 由 768 维的 Query Token 生成。
+        # Key (K) 和 Value (V): 必须由 1408 维的视觉特征生成
+        # self.query: 将输入隐状态投射成 Query (Q)
         self.query = nn.Linear(config.hidden_size, self.all_head_size)
+
+        # 交叉注意力的关键区别所在：
         if is_cross_attention:
+            # 如果是交叉注意力，Key (K) 和 Value (V) 的源是 encoder_hidden_states (视觉特征) (即视觉模型的维度，1408)
+            # 因此输入维度是 config.encoder_hidden_size，是视觉模型的维度，1408
             self.key = nn.Linear(config.encoder_hidden_size, self.all_head_size)
             self.value = nn.Linear(config.encoder_hidden_size, self.all_head_size)
         else:
+            # 如果是自注意力，K 和 V 的源是 hidden_states (自身)
+            # 因此输入维度是 config.hidden_size，是 Q-Former 的维度，768
             self.key = nn.Linear(config.hidden_size, self.all_head_size)
             self.value = nn.Linear(config.hidden_size, self.all_head_size)
 
+        # self.dropout: 对注意力概率施加的 dropout
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+        # self.position_embedding_type: 位置编码类型，这里通常是 'absolute'
         self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
             self.max_position_embeddings = config.max_position_embeddings
             self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
+        
+        # self.save_attention: 用于调试，是否保存注意力图
         self.save_attention = False
 
     def save_attn_gradients(self, attn_gradients):
@@ -656,48 +697,66 @@ class Blip2QFormerMultiHeadAttention(nn.Module):
         return self.attention_map
 
     def transpose_for_scores(self, x):
+        """
+        将线性投射后的 Q,K,V 张量 (B, S, H) 变形为多头注意力的格式 (B, N, S, D)。
+        B = batch_size, S = sequence_length, H = hidden_size
+        N = num_attention_heads, D = attention_head_size
+        """
+        # new_x_shape: (batch_size, seq_len, num_heads, head_dim)
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
+        # return: (batch_size, num_heads, seq_len, head_dim)
         return x.permute(0, 2, 1, 3)
 
     def forward(
         self,
+        # hidden_states: 目标序列，用于生成 Query。形状 (B, S_q, H)
         hidden_states,
         attention_mask=None,
         head_mask=None,
+        # encoder_hidden_states: 源序列，用于生成 Key 和 Value (仅在交叉注意力时提供)
         encoder_hidden_states=None,
         encoder_attention_mask=None,
         past_key_value=None,
         output_attentions=False,
     ):
-        # If this is instantiated as a cross-attention module, the keys
-        # and values come from an encoder; the attention mask needs to be
-        # such that the encoder's padding tokens are not attended to.
+        # ----------------- 1. 判断模式并计算 K, V -----------------
+        # is_cross_attention: 如果提供了 encoder_hidden_states，则当前为交叉注意力模式
         is_cross_attention = encoder_hidden_states is not None
 
         if is_cross_attention:
+            # 交叉注意力模式：K 和 V 来自 encoder_hidden_states (视觉特征)
             key_layer = self.transpose_for_scores(self.key(encoder_hidden_states))
             value_layer = self.transpose_for_scores(self.value(encoder_hidden_states))
+            # 注意力掩码也使用源序列的掩码
             attention_mask = encoder_attention_mask
         elif past_key_value is not None:
+            # 自注意力模式 (带缓存)：K, V 来自 hidden_states，并与缓存拼接
             key_layer = self.transpose_for_scores(self.key(hidden_states))
             value_layer = self.transpose_for_scores(self.value(hidden_states))
             key_layer = torch.cat([past_key_value[0], key_layer], dim=2)
             value_layer = torch.cat([past_key_value[1], value_layer], dim=2)
         else:
+            # 自注意力模式 (无缓存)：K, V 来自 hidden_states
             key_layer = self.transpose_for_scores(self.key(hidden_states))
             value_layer = self.transpose_for_scores(self.value(hidden_states))
 
+        # ----------------- 2. 计算 Q -----------------
+        # mixed_query_layer: 对目标序列 hidden_states 进行线性投射
         mixed_query_layer = self.query(hidden_states)
-
+        # query_layer: 变形以匹配多头格式。Q 永远来自 hidden_states
         query_layer = self.transpose_for_scores(mixed_query_layer)
 
+        # ----------------- 3. 计算注意力分数 -----------------
+        # past_key_value: 更新或创建当前层的 K,V 缓存
         past_key_value = (key_layer, value_layer)
 
-        # Take the dot product between "query" and "key" to get the raw attention scores.
+        # attention_scores = (Q * K^T) / sqrt(d_k)
+        # 这是注意力的核心计算：Q 和 K 的点积
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
 
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
+            # (相对位置编码逻辑，当前模型配置下通常不进入此分支)
             seq_length = hidden_states.size()[1]
             position_ids_l = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).view(-1, 1)
             position_ids_r = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).view(1, -1)
@@ -713,36 +772,44 @@ class Blip2QFormerMultiHeadAttention(nn.Module):
                 relative_position_scores_key = torch.einsum("bhrd,lrd->bhlr", key_layer, positional_embedding)
                 attention_scores = attention_scores + relative_position_scores_query + relative_position_scores_key
 
+        # 除以 sqrt(d_k) 进行缩放，防止梯度消失
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
 
         if attention_mask is not None:
-            # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
+            # 应用注意力掩码，将不想被注意的位置设为极小的负数
             attention_scores = attention_scores + attention_mask
 
-        # Normalize the attention scores to probabilities.
+        # attention_probs: 对分数进行 softmax，得到归一化的注意力权重
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
 
+        # 仅在交叉注意力且需要保存时，保存注意力图用于分析
         if is_cross_attention and self.save_attention:
             self.save_attention_map(attention_probs)
             attention_probs.register_hook(self.save_attn_gradients)
 
-        # This is actually dropping out entire tokens to attend to, which might
-        # seem a bit unusual, but is taken from the original Transformer paper.
+        # 对注意力权重进行 dropout
         attention_probs_dropped = self.dropout(attention_probs)
 
-        # Mask heads if we want to
+        # 应用头掩码进行剪枝
         if head_mask is not None:
             attention_probs_dropped = attention_probs_dropped * head_mask
-
+        
+        # ----------------- 4. 计算最终输出 -----------------
+        # context_layer = Attention(Q,K,V) = softmax(...) * V
+        # 用加权的注意力概率乘以 V，得到融合了上下文信息的新表示
         context_layer = torch.matmul(attention_probs_dropped, value_layer)
 
+        # 将多头输出重新变形回 (B, S, H)
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
 
+        # outputs: 准备返回值
         outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
 
+        # 添加 K,V 缓存到返回值
         outputs = outputs + (past_key_value,)
+        # return: (融合上下文的输出, 可选的注意力权重, K,V缓存)
         return outputs
 
 
@@ -762,13 +829,23 @@ class Blip2QFormerSelfOutput(nn.Module):
 
 
 class Blip2QFormerAttention(nn.Module):
+    """
+    Q-Former 注意力层的高级封装。
+    它内部包含了核心的多头注意力模块 (`Blip2QFormerMultiHeadAttention`)
+    以及注意力计算后的输出处理模块 (`Blip2QFormerSelfOutput`)。
+    """
+
     def __init__(self, config, is_cross_attention=False):
         super().__init__()
+        # self.attention: 核心的多头注意力实现，传入 is_cross_attention 来决定其模式
         self.attention = Blip2QFormerMultiHeadAttention(config, is_cross_attention)
+        # self.output: 注意力计算后的处理层，包含全连接、dropout 和残差连接+LayerNorm
         self.output = Blip2QFormerSelfOutput(config)
+        # self.pruned_heads: 记录被剪枝的注意力头
         self.pruned_heads = set()
 
     def prune_heads(self, heads):
+        # (剪枝逻辑)
         if len(heads) == 0:
             return
         heads, index = find_pruneable_heads_and_indices(
@@ -788,14 +865,18 @@ class Blip2QFormerAttention(nn.Module):
 
     def forward(
         self,
+        # hidden_states: 输入隐状态
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
+        # encoder_hidden_states: 视觉特征，如果提供，则 self.attention 会工作在交叉注意力模式
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         past_key_value: Optional[tuple[tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,
     ) -> tuple[torch.Tensor]:
+        # 步骤 1: 调用核心的多头注意力模块
+        # self_outputs: (context_layer, optional_attention_probs, past_key_value)
         self_outputs = self.attention(
             hidden_states,
             attention_mask,
@@ -805,7 +886,11 @@ class Blip2QFormerAttention(nn.Module):
             past_key_value,
             output_attentions,
         )
+        # 步骤 2: 将注意力模块的输出 (context_layer) 和原始输入 (hidden_states)
+        # 一起送入输出处理模块（全连接 + dropout + 残差 + layernorm） 
+        # attention_output: 经过完整注意力层（包括后处理）的最终输出
         attention_output = self.output(self_outputs[0], hidden_states)
+        # 整理返回值：将最终输出和可能的其他返回值（注意力权重，K,V缓存）打包
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
         return outputs
 
@@ -842,40 +927,68 @@ class Blip2QFormerOutput(nn.Module):
 
 
 class Blip2QFormerLayer(GradientCheckpointingLayer):
+    """
+    Q-Former 的单层 Transformer Block。
+    它包含一个自注意力模块，一个可选的交叉注意力模块（用于与视觉特征交互），
+    以及两个独立的前馈网络（一个用于 query token，一个用于 text token）。
+    """
+
     def __init__(self, config, layer_idx):
         super().__init__()
+        # self.chunk_size_feed_forward: 前馈网络中的分块计算大小，用于节省显存
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
+        # self.seq_len_dim: 在张量中，序列长度所在的维度，用于分块计算
         self.seq_len_dim = 1
+        # self.attention: 层的自注意力模块 (self-attention)
         self.attention = Blip2QFormerAttention(config)
 
+        # self.layer_idx: 当前层的索引（从 0 开始）
         self.layer_idx = layer_idx
 
+        # Q-Former 的一个核心设计：并非每层都有交叉注意力。
+        # self.has_cross_attention: 根据层索引判断当前层是否需要执行交叉注意力
         if layer_idx % config.cross_attention_frequency == 0:
+            # self.crossattention: 如果需要，则实例化一个交叉注意力模块
             self.crossattention = Blip2QFormerAttention(config, is_cross_attention=True)
             self.has_cross_attention = True
         else:
             self.has_cross_attention = False
 
+        # 如果 Q-Former 也被用于处理文本输入（例如，在图文检索任务中），则需要一个专门用于文本的前馈网络
         if config.use_qformer_text_input:
+            # self.intermediate / self.output: 用于文本部分的前馈网络 (FFN)
             self.intermediate = Blip2QFormerIntermediate(config)
             self.output = Blip2QFormerOutput(config)
 
+        # 无论如何，都需要一个专门用于 query token 的前馈网络
+        # self.intermediate_query / self.output_query: 用于 query 部分的前馈网络 (FFN)
         self.intermediate_query = Blip2QFormerIntermediate(config)
         self.output_query = Blip2QFormerOutput(config)
 
     def forward(
         self,
+        # hidden_states: 输入到当前层的隐状态, 形状为 (batch_size, sequence_length, hidden_size)
+        # 它可以包含 query token 的 embedding，也可以包含文本 token 的 embedding
         hidden_states,
+        # attention_mask: 自注意力的掩码
         attention_mask=None,
+        # head_mask: 用于剪枝（pruning）某些注意力头的掩码
         head_mask=None,
+        # encoder_hidden_states: 编码器（即视觉模型）的输出，用于交叉注意力
         encoder_hidden_states=None,
+        # encoder_attention_mask: 视觉特征的注意力掩码
         encoder_attention_mask=None,
+        # past_key_value: 在生成任务中用于缓存 attention 的 K, V 矩阵，以加速解码
         past_key_value=None,
+        # output_attentions: 是否输出注意力权重
         output_attentions=False,
+        # query_length: 输入序列中 query token 的数量 (例如 32)
         query_length=0,
     ):
-        # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
+        # ----------------- 1. 自注意力模块 (Self-Attention) -----------------
+        # self_attn_past_key_value: 从缓存中获取上一时间步的 K,V
         self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
+        # self_attention_outputs: 调用自注意力模块，输入是 hidden_states
         self_attention_outputs = self.attention(
             hidden_states,
             attention_mask,
@@ -883,17 +996,28 @@ class Blip2QFormerLayer(GradientCheckpointingLayer):
             output_attentions=output_attentions,
             past_key_value=self_attn_past_key_value,
         )
+        # attention_output: 自注意力计算后的主要输出，形状与输入 hidden_states 相同
         attention_output = self_attention_outputs[0]
+        # outputs: 一个元组，用于收集除 hidden_states 外的其他输出（如注意力权重）
         outputs = self_attention_outputs[1:-1]
 
+        # present_key_value: 当前时间步的 K,V，用于下一时间步的缓存
         present_key_value = self_attention_outputs[-1]
 
+        # ----------------- 2. 交叉注意力 & 前馈网络 (Cross-Attention & FFN) -----------------
+        # Q-Former 对 query token 和 text token 的处理方式不同
         if query_length > 0:
+            # ---- 2a. 处理 Query Token ----
+            # query_attention_output: 从自注意力输出中切片出属于 query 的部分
             query_attention_output = attention_output[:, :query_length, :]
 
+            # 如果当前层配置了交叉注意力
             if self.has_cross_attention:
                 if encoder_hidden_states is None:
                     raise ValueError("encoder_hidden_states must be given for cross-attention layers")
+                # cross_attention_outputs: 执行交叉注意力
+                # Query: 来自 query_attention_output
+                # Key & Value: 来自视觉编码器的输出 encoder_hidden_states
                 cross_attention_outputs = self.crossattention(
                     query_attention_output,
                     attention_mask,
@@ -902,10 +1026,12 @@ class Blip2QFormerLayer(GradientCheckpointingLayer):
                     encoder_attention_mask,
                     output_attentions=output_attentions,
                 )
+                # query_attention_output: 经过交叉注意力后，query token 的表示已经融合了视觉信息
                 query_attention_output = cross_attention_outputs[0]
-                # add cross attentions if we output attention weights
+                # outputs: 收集交叉注意力的权重（如果需要）
                 outputs = outputs + cross_attention_outputs[1:-1]
 
+            # layer_output: 将融合了视觉信息的 query 表示送入专门为 query 设计的前馈网络
             layer_output = apply_chunking_to_forward(
                 self.feed_forward_chunk_query,
                 self.chunk_size_feed_forward,
@@ -913,81 +1039,126 @@ class Blip2QFormerLayer(GradientCheckpointingLayer):
                 query_attention_output,
             )
 
+            # ---- 2b. 处理 Text Token (如果存在) ----
+            # 如果自注意力输出的序列长度大于 query token 的数量，说明还包含了文本 token
             if attention_output.shape[1] > query_length:
+                # layer_output_text: 将属于文本的部分送入专门为文本设计的前馈网络
                 layer_output_text = apply_chunking_to_forward(
                     self.feed_forward_chunk,
                     self.chunk_size_feed_forward,
                     self.seq_len_dim,
                     attention_output[:, query_length:, :],
                 )
+                # layer_output: 将处理完的 query 部分和 text 部分重新拼接起来
                 layer_output = torch.cat([layer_output, layer_output_text], dim=1)
         else:
+            # 如果没有 query token (query_length=0)，说明此时 Q-Former 仅作为文本编码器使用
+            # 此时所有 token 都通过为文本设计的前馈网络
             layer_output = apply_chunking_to_forward(
                 self.feed_forward_chunk,
                 self.chunk_size_feed_forward,
                 self.seq_len_dim,
                 attention_output,
             )
+        # ----------------- 3. 整理输出 -----------------
+        # 将最终的隐状态作为第一个元素添加到输出元组中
         outputs = (layer_output,) + outputs
 
+        # 将当前层的 K,V 缓存添加到输出元组的末尾
         outputs = outputs + (present_key_value,)
 
+        # 返回元组: (最终隐状态, 可选的注意力权重..., K,V缓存)
         return outputs
 
     def feed_forward_chunk(self, attention_output):
+        """为文本部分服务的前馈网络"""
         intermediate_output = self.intermediate(attention_output)
         layer_output = self.output(intermediate_output, attention_output)
         return layer_output
 
     def feed_forward_chunk_query(self, attention_output):
+        """为 Query 部分服务的前馈网络"""
         intermediate_output = self.intermediate_query(attention_output)
         layer_output = self.output_query(intermediate_output, attention_output)
         return layer_output
 
 
 class Blip2QFormerEncoder(nn.Module):
+    """
+    Q-Former Encoder 的主干，它由多个 Blip2QFormerLayer 堆叠而成。
+    负责管理数据在各层之间的顺序传递。
+    """
+
     def __init__(self, config):
         super().__init__()
+        # self.config: 保存模型配置
         self.config = config
+        # self.layer: 一个 ModuleList，包含了模型所有的 Blip2QFormerLayer
         self.layer = nn.ModuleList(
             [Blip2QFormerLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
+        # self.gradient_checkpointing: 是否启用梯度检查点，用于在训练时节省显存
         self.gradient_checkpointing = False
 
     def forward(
         self,
+        # hidden_states: 输入到 Encoder 的初始隐状态
         hidden_states,
+        # attention_mask: 整个 Encoder 使用的自注意力掩码
         attention_mask=None,
+        # head_mask: 整个 Encoder 使用的注意力头剪枝掩码
         head_mask=None,
+        # encoder_hidden_states: 来自视觉模型的特征，会传递给每一层 Blip2QFormerLayer
         encoder_hidden_states=None,
+        # encoder_attention_mask: 视觉特征的注意力掩码
         encoder_attention_mask=None,
+        # past_key_values: 所有层的 K,V 缓存，是一个元组
         past_key_values=None,
+        # use_cache: 是否使用并返回 K,V 缓存
         use_cache=None,
+        # output_attentions: 是否输出所有层的注意力权重
         output_attentions=False,
+        # output_hidden_states: 是否输出所有层的隐状态
         output_hidden_states=False,
+        # return_dict: 是否以 ModelOutput 对象（字典形式）返回结果
         return_dict=True,
+        # query_length: query token 的数量，会传递给每一层
         query_length=0,
     ):
+        # 初始化用于收集所有层输出的容器
+        # all_hidden_states: 用于收集每层输入的隐状态
         all_hidden_states = () if output_hidden_states else None
+        # all_self_attentions: 用于收集每层的自注意力权重
         all_self_attentions = () if output_attentions else None
+        # all_cross_attentions: 用于收集每层的交叉注意力权重
         all_cross_attentions = () if output_attentions else None
 
+        # next_decoder_cache: 用于收集每层输出的 K,V 缓存
         next_decoder_cache = () if use_cache else None
 
+        # 核心循环：遍历 Encoder 中的每一层
         for i in range(self.config.num_hidden_layers):
+            # layer_module: 获取当前循环的层模块
             layer_module = self.layer[i]
+
+            # 如果需要，保存当前层的输入隐状态
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
+            # 为当前层准备输入
+            # layer_head_mask: 从总的 head_mask 中获取当前层对应的部分
             layer_head_mask = head_mask[i] if head_mask is not None else None
+            # past_key_value: 从总的 K,V 缓存中获取当前层对应的部分
             past_key_value = past_key_values[i] if past_key_values is not None else None
 
+            # 梯度检查点和 use_cache 不能同时使用
             if getattr(self.config, "gradient_checkpointing", False) and self.training and use_cache:
                 logger.warning(
                     "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
                 )
                 use_cache = False
 
+            # 调用当前层模块的 forward 方法，进行实际计算
             layer_outputs = layer_module(
                 hidden_states,
                 attention_mask,
@@ -999,18 +1170,27 @@ class Blip2QFormerEncoder(nn.Module):
                 query_length,
             )
 
+            # 更新 hidden_states，当前层的输出成为下一层的输入
             hidden_states = layer_outputs[0]
+
+            # 如果使用缓存，收集当前层返回的新 K,V
             if use_cache:
                 next_decoder_cache += (layer_outputs[-1],)
+            
+            # 如果需要，收集当前层的注意力权重
             if output_attentions:
                 all_self_attentions = all_self_attentions + (layer_outputs[1],)
+                # 只有包含交叉注意力的层才会返回交叉注意力权重
                 if layer_module.has_cross_attention:
                     all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
 
+        # 如果需要，保存最后一层的输出隐状态
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
+        # 根据 return_dict 的值，决定返回格式
         if not return_dict:
+            # 如果是 False，返回一个元组
             return tuple(
                 v
                 for v in [
@@ -1022,6 +1202,7 @@ class Blip2QFormerEncoder(nn.Module):
                 ]
                 if v is not None
             )
+        # 如果是 True，返回一个 BaseModelOutputWithPastAndCrossAttentions 对象
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=next_decoder_cache,
@@ -1092,9 +1273,11 @@ class Blip2QFormerModel(Blip2PreTrainedModel):
         super().__init__(config)
         self.config = config
 
+        # 输入 `query_embeds` 的层归一化
         self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
+        # Q-Former 的核心 Transformer 结构
         self.encoder = Blip2QFormerEncoder(config)
 
         self.post_init()
@@ -1196,8 +1379,9 @@ class Blip2QFormerModel(Blip2PreTrainedModel):
             query_length if query_length is not None else query_embeds.shape[1] if query_embeds is not None else 0
         )
 
-        # `Blip2QFormerModel` is kept as fp32
+        # `Blip2QFormerModel` 模型及其可学习的 query token 通常保持在 float32 精度以保证稳定性
         query_embeds = query_embeds.to(self.layernorm.weight.dtype)
+        # 步骤 1: 对输入的 query embedding 进行层归一化和 dropout
         embedding_output = self.layernorm(query_embeds)
         embedding_output = self.dropout(embedding_output)
 
@@ -1215,7 +1399,7 @@ class Blip2QFormerModel(Blip2PreTrainedModel):
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
         if encoder_hidden_states is not None:
-            # Qformer and latent query tokens are kept in fp32. We cast `encoder_hidden_states` if not fp32 already
+            # Qformer 和 latent query tokens 为了数值稳定性保持在 fp32。我们在此处转换 `encoder_hidden_states` 的数据类型。
             if encoder_hidden_states.dtype != query_embeds.dtype:
                 encoder_hidden_states = encoder_hidden_states.to(query_embeds.dtype)
 
@@ -1242,6 +1426,7 @@ class Blip2QFormerModel(Blip2PreTrainedModel):
         # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
 
+        # 步骤 2: 将处理后的 query embedding 和视觉特征送入 Q-Former Encoder
         encoder_outputs = self.encoder(
             embedding_output,
             attention_mask=extended_attention_mask,
@@ -1256,6 +1441,7 @@ class Blip2QFormerModel(Blip2PreTrainedModel):
             query_length=query_length,
         )
         sequence_output = encoder_outputs[0]
+        # 步骤 3: 提取第一个 token 的输出作为池化输出
         pooled_output = sequence_output[:, 0, :]
 
         if not return_dict:
@@ -1293,6 +1479,13 @@ class Blip2Model(Blip2PreTrainedModel):
         self.query_tokens = nn.Parameter(torch.zeros(1, config.num_query_tokens, config.qformer_config.hidden_size))
         self.qformer = Blip2QFormerModel._from_config(config.qformer_config)
 
+        # 投射层，将 Q-Former 的输出维度映射到语言模型的输入维度
+        # --------------------------------------------------------------------
+        # 这是 BLIP-2 第二阶段训练的核心。
+        # 它的作用是将 Q-Former 输出的视觉特征 (维度=qformer_config.hidden_size)
+        # 投射/翻译成语言模型能够理解的嵌入表示 (维度=text_config.hidden_size)。
+        # 在第二阶段训练中，视觉编码器和 Q-Former 被冻结，只有这个投射层和语言模型被训练。
+        # --------------------------------------------------------------------
         self.language_projection = nn.Linear(config.qformer_config.hidden_size, config.text_config.hidden_size)
         if config.use_decoder_only_language_model:
             language_model = AutoModelForCausalLM.from_config(config.text_config)
@@ -1595,11 +1788,14 @@ class Blip2Model(Blip2PreTrainedModel):
         )
         query_output = query_outputs[0]
 
-        # Qformer is kept in fp32, we downcast the output back if needed
+        # Q-Former 的输出精度可能与视觉主干不同（通常 Q-Former 是 fp32），需在此处对齐
         if query_output.dtype != image_embeds.dtype:
             query_output = query_output.to(image_embeds.dtype)
 
         # step 3: use the language model, conditioned on the query outputs and the prompt
+        # language_model_inputs 是调用全连接层后的输出，
+    # 它现在是语言模型可以理解的 "soft prompt"
+    # 维度从 [batch_size, 32, 768] 被“翻译”成了 [batch_size, 32, LLM_hidden_size]
         language_model_inputs = self.language_projection(query_output)
         language_model_attention_mask = torch.ones(
             language_model_inputs.size()[:-1], dtype=torch.long, device=language_model_inputs.device
@@ -1887,6 +2083,13 @@ class Blip2ForConditionalGeneration(Blip2PreTrainedModel, GenerationMixin):
         self.query_tokens = nn.Parameter(torch.zeros(1, config.num_query_tokens, config.qformer_config.hidden_size))
         self.qformer = Blip2QFormerModel._from_config(config.qformer_config)
 
+        # 投射层，将 Q-Former 的输出维度映射到语言模型的输入维度
+        # --------------------------------------------------------------------
+        # 这是 BLIP-2 第二阶段训练的核心。
+        # 它的作用是将 Q-Former 输出的视觉特征 (维度=qformer_config.hidden_size)
+        # 投射/翻译成语言模型能够理解的嵌入表示 (维度=text_config.hidden_size)。
+        # 在第二阶段训练中，视觉编码器和 Q-Former 被冻结，只有这个投射层和语言模型被训练。
+        # --------------------------------------------------------------------
         self.language_projection = nn.Linear(config.qformer_config.hidden_size, config.text_config.hidden_size)
         if config.use_decoder_only_language_model:
             language_model = AutoModelForCausalLM.from_config(config.text_config)
@@ -1979,7 +2182,7 @@ class Blip2ForConditionalGeneration(Blip2PreTrainedModel, GenerationMixin):
         )
         query_output = query_outputs[0]
 
-        # Qformer is kept in fp32, we downcast the output back if needed
+        # Q-Former 的输出精度可能与视觉主干不同（通常 Q-Former 是 fp32），需在此处对齐
         if query_output.dtype != image_embeds.dtype:
             query_output = query_output.to(image_embeds.dtype)
 
@@ -2206,7 +2409,7 @@ class Blip2ForConditionalGeneration(Blip2PreTrainedModel, GenerationMixin):
         )
         query_output = query_outputs.last_hidden_state
 
-        # Qformer is kept in fp32, we downcast the output back if needed
+        # Q-Former 的输出精度可能与视觉主干不同（通常 Q-Former 是 fp32），需在此处对齐
         if query_output.dtype != image_embeds.dtype:
             query_output = query_output.to(image_embeds.dtype)
 
